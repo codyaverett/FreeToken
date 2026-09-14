@@ -922,3 +922,274 @@ def test_model_load_launch_failure_reports_error(monkeypatch):
     assert health.status_code == 503
     assert health.json()["status"] == "error"
     assert health.json()["message"] == "download failed"
+
+
+# ------------------------------------------------------ anthropic messages --
+
+from freetoken.server import metal_anthropic as ma
+
+
+def _anthropic_req(**overrides):
+    body = {
+        "model": "claude-sonnet-5",
+        "max_tokens": 32,
+        "messages": [{"role": "user", "content": "hi"}],
+    }
+    body.update(overrides)
+    return ma.AnthropicMessagesRequest.model_validate(body)
+
+
+def test_anthropic_request_overrides_model_and_flattens_blocks():
+    req = _anthropic_req(
+        system="be brief",
+        messages=[
+            {"role": "system", "content": "and polite"},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "look"},
+                    {"type": "image", "source": {"type": "base64", "data": "AAAA"}},
+                ],
+            },
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "thinking", "thinking": "hmm"},
+                    {"type": "tool_use", "id": "toolu_1", "name": "ls", "input": {"p": "/"}},
+                ],
+            },
+            {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": "a b"}],
+            },
+        ],
+        tools=[{"name": "ls", "description": "list", "input_schema": {"properties": {}}}],
+        stop_sequences=["END"],
+        temperature=0.2,
+        stream=True,
+    )
+    body = ma.anthropic_to_chat_request(req, upstream_model="mlx-community/m")
+    assert body["model"] == "mlx-community/m"
+    assert body["messages"][0] == {"role": "system", "content": "be brief\n\nand polite"}
+    assert body["messages"][1] == {"role": "user", "content": "look"}
+    assistant = body["messages"][2]
+    assert assistant["reasoning_content"] == "hmm"
+    assert assistant["tool_calls"][0]["function"] == {"name": "ls", "arguments": '{"p": "/"}'}
+    assert body["messages"][3] == {"role": "tool", "tool_call_id": "toolu_1", "content": "a b"}
+    assert body["tools"][0]["function"]["name"] == "ls"
+    assert body["tools"][0]["function"]["parameters"]["type"] == "object"
+    assert body["stop"] == ["END"]
+    assert body["temperature"] == 0.2
+    assert body["max_tokens"] == 32
+    assert body["stream"] is True and body["stream_options"] == {"include_usage": True}
+
+
+def test_anthropic_request_tool_choice_none_hides_tools_and_thinking_toggle():
+    req = _anthropic_req(
+        tools=[{"name": "ls", "input_schema": {"type": "object"}}],
+        tool_choice={"type": "none"},
+        thinking={"type": "disabled"},
+    )
+    body = ma.anthropic_to_chat_request(req, upstream_model="m")
+    assert "tools" not in body
+    assert body["chat_template_kwargs"] == {"enable_thinking": False}
+    assert "stream" not in body
+
+
+def test_anthropic_response_from_chat_completion():
+    payload = {
+        "id": "chatcmpl-1",
+        "choices": [
+            {
+                "index": 0,
+                "finish_reason": "stop",
+                "message": {
+                    "role": "assistant",
+                    "reasoning": "think",
+                    "content": "hello",
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {"name": "ls", "arguments": '{"p": "/"}'},
+                        }
+                    ],
+                },
+            }
+        ],
+        "usage": {
+            "prompt_tokens": 7,
+            "completion_tokens": 3,
+            "prompt_tokens_details": {"cached_tokens": 5},
+        },
+    }
+    msg = ma.chat_response_to_anthropic(payload, "claude-sonnet-5").model_dump(exclude_none=True)
+    assert msg["model"] == "claude-sonnet-5"
+    assert [b["type"] for b in msg["content"]] == ["thinking", "text", "tool_use"]
+    assert msg["content"][0]["thinking"] == "think"
+    assert msg["content"][1]["text"] == "hello"
+    assert msg["content"][2] == {"type": "tool_use", "id": "call_1", "name": "ls", "input": {"p": "/"}}
+    assert msg["stop_reason"] == "tool_use"
+    assert msg["usage"] == {"input_tokens": 7, "output_tokens": 3, "cache_read_input_tokens": 5}
+
+
+def test_anthropic_response_plain_text_end_turn():
+    payload = {
+        "choices": [{"finish_reason": "length", "message": {"role": "assistant", "content": "x"}}],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+    }
+    msg = ma.chat_response_to_anthropic(payload, "m")
+    assert [b.type for b in msg.content] == ["text"]
+    assert msg.stop_reason == "max_tokens"
+
+
+def _collect_events(chunks):
+    async def lines():
+        for chunk in chunks:
+            yield chunk
+
+    async def run():
+        return [frame async for frame in ma.chat_stream_to_anthropic(lines(), "m")]
+
+    frames = asyncio.run(run())
+    events = []
+    for frame in frames:
+        head, data = frame.split("\n", 1)
+        events.append((head.removeprefix("event: "), json.loads(data.removeprefix("data: "))))
+    return events
+
+
+def _chunk(delta=None, finish_reason=None, usage=None):
+    payload = {"choices": [{"index": 0, "delta": delta or {}, "finish_reason": finish_reason}]}
+    if usage is not None:
+        payload = {"choices": [], "usage": usage}
+    return b"data: " + json.dumps(payload).encode()
+
+
+def test_anthropic_stream_translation_sequence():
+    events = _collect_events(
+        [
+            b": keepalive 1/12",
+            _chunk({"role": "assistant", "reasoning": ""}),
+            _chunk({"reasoning": "th"}),
+            _chunk({"reasoning": "ink"}),
+            _chunk({"content": "hel"}),
+            _chunk({"content": "lo"}),
+            _chunk(
+                {
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "index": 0,
+                            "type": "function",
+                            "function": {"name": "ls", "arguments": '{"p": "/"}'},
+                        }
+                    ]
+                },
+                finish_reason="tool_calls",
+            ),
+            _chunk(usage={"prompt_tokens": 4, "completion_tokens": 6}),
+            b"data: [DONE]",
+        ]
+    )
+    assert [e[0] for e in events] == [
+        "message_start",
+        "ping",
+        "content_block_start",  # thinking
+        "content_block_delta",
+        "content_block_delta",
+        "content_block_delta",  # signature_delta
+        "content_block_stop",
+        "content_block_start",  # text
+        "content_block_delta",
+        "content_block_delta",
+        "content_block_stop",
+        "content_block_start",  # tool_use
+        "content_block_delta",
+        "content_block_stop",
+        "message_delta",
+        "message_stop",
+    ]
+    by_type = {}
+    for name, data in events:
+        by_type.setdefault(name, []).append(data)
+    starts = by_type["content_block_start"]
+    assert [s["content_block"]["type"] for s in starts] == ["thinking", "text", "tool_use"]
+    assert [s["index"] for s in starts] == [0, 1, 2]
+    assert starts[2]["content_block"]["name"] == "ls"
+    deltas = by_type["content_block_delta"]
+    assert deltas[0]["delta"] == {"type": "thinking_delta", "thinking": "th"}
+    assert deltas[2]["delta"] == {"type": "signature_delta", "signature": ""}
+    assert deltas[3]["delta"] == {"type": "text_delta", "text": "hel"}
+    assert deltas[5]["delta"] == {"type": "input_json_delta", "partial_json": '{"p": "/"}'}
+    tail = by_type["message_delta"][0]
+    assert tail["delta"] == {"stop_reason": "tool_use"}
+    assert tail["usage"] == {"input_tokens": 4, "output_tokens": 6}
+    assert not any(name == "message_stop" for name, _ in events[:-1])
+
+
+def test_anthropic_stream_without_usage_chunk_reports_zero():
+    events = _collect_events([_chunk({"content": "hi"}, finish_reason="stop")])
+    tail = dict(events)["message_delta"]
+    assert tail["delta"] == {"stop_reason": "end_turn"}
+    assert tail["usage"] == {"input_tokens": 0, "output_tokens": 0}
+
+
+def test_anthropic_count_tokens_falls_back_to_estimate():
+    req = ma.AnthropicCountTokensRequest.model_validate(
+        {"model": "m", "messages": [{"role": "user", "content": "x" * 400}]}
+    )
+    assert ma.count_tokens(req, None) >= 100
+
+    class Tok:
+        def apply_chat_template(self, messages, tools=None, tokenize=True, add_generation_prompt=True):
+            return [0] * 17
+
+    assert ma.count_tokens(req, Tok()) == 17
+
+
+def test_proxy_messages_route_translates_against_upstream():
+    port = _free_port()
+    stop = _start_upstream(port)
+    try:
+        handle = metal.MetalBackendHandle(
+            processes=[SimpleNamespace(poll=lambda: None)],
+            upstream_base_url=f"http://127.0.0.1:{port}",
+            backend="mlx",
+            model_path="test-model",
+        )
+        handle.load_state = "ready"
+        proxy = FastAPI()
+        metal.register_metal_proxy_routes(proxy, lambda: handle)
+        client = TestClient(proxy, raise_server_exceptions=False)
+
+        r = client.post(
+            "/v1/messages",
+            json={"model": "claude-x", "max_tokens": 8, "messages": [{"role": "user", "content": "hi"}]},
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["type"] == "message" and body["role"] == "assistant"
+        assert body["model"] == "claude-x"
+        assert body["content"] == [{"type": "text", "text": "hello from upstream"}]
+        assert body["stop_reason"] == "end_turn"
+        assert body["usage"] == {"input_tokens": 1, "output_tokens": 3}
+        assert client.get("/v1/stats").json()["requests"]["completed"] == 1
+
+        r = client.post("/v1/messages", json={"model": "claude-x", "messages": []})
+        assert r.status_code == 400
+        assert r.json()["error"]["type"] == "invalid_request_error"
+    finally:
+        stop()
+
+
+def test_proxy_messages_503_in_anthropic_shape_when_backend_down():
+    proxy = FastAPI()
+    metal.register_metal_proxy_routes(proxy, lambda: None)
+    client = TestClient(proxy, raise_server_exceptions=False)
+    r = client.post("/v1/messages", json={"model": "m", "max_tokens": 1, "messages": []})
+    assert r.status_code == 503
+    assert r.json() == {
+        "type": "error",
+        "error": {"type": "overloaded_error", "message": "Metal backend is not running"},
+    }

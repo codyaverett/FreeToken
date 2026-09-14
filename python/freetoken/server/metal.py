@@ -1102,11 +1102,11 @@ def register_metal_proxy_routes(
 
     @app.post("/v1/messages")
     async def proxy_messages(request: Request):
-        return await _forward(request, get_backend)
+        return await _forward_anthropic(request, get_backend)
 
     @app.post("/v1/messages/count_tokens")
     async def proxy_messages_count_tokens(request: Request):
-        return await _forward(request, get_backend)
+        return await _count_tokens_anthropic(request, get_backend)
 
     @app.post("/v1/responses")
     async def proxy_responses(request: Request):
@@ -1307,6 +1307,150 @@ def _inject_turn_stop(path: str, body: bytes, stream: bool) -> tuple[bytes, bool
     stop.append("<turn|>")
     payload["stop"] = stop
     return json.dumps(payload).encode(), stream
+
+
+def _anthropic_error(status: int, kind: str, message: str) -> JSONResponse:
+    return JSONResponse(
+        {"type": "error", "error": {"type": kind, "message": message}},
+        status_code=status,
+    )
+
+
+def _anthropic_backend_unavailable(handle: MetalBackendHandle | None) -> JSONResponse | None:
+    if handle is None or not handle.is_alive():
+        return _anthropic_error(503, "overloaded_error", "Metal backend is not running")
+    if not getattr(handle, "is_ready", lambda: True)():
+        doc = handle.health_doc()
+        return _anthropic_error(
+            503, "overloaded_error", f"model is still loading ({doc.get('phase', 'starting')})"
+        )
+    return None
+
+
+async def _forward_anthropic(request: Request, get_backend: Any) -> Response:
+    """Serve Anthropic ``/v1/messages`` by translating to the upstream's OpenAI
+    chat route and back (see metal_anthropic). Errors take the Anthropic error
+    shape so Claude Code classifies them instead of retrying blindly."""
+    from .metal_anthropic import (
+        AnthropicMessagesRequest,
+        anthropic_to_chat_request,
+        chat_response_to_anthropic,
+        chat_stream_to_anthropic,
+    )
+
+    handle = get_backend()
+    unavailable = _anthropic_backend_unavailable(handle)
+    if unavailable is not None:
+        return unavailable
+    try:
+        req = AnthropicMessagesRequest.model_validate_json(await request.body())
+    except ValueError as exc:
+        return _anthropic_error(400, "invalid_request_error", str(exc))
+
+    public_model = req.model
+    chat_body = anthropic_to_chat_request(req, upstream_model=handle.model_path)
+    body, stream = _inject_turn_stop(
+        "/v1/chat/completions", json.dumps(chat_body).encode(), bool(req.stream)
+    )
+    headers = {"content-type": "application/json", "accept": "application/json"}
+    url = f"{handle.upstream_base_url}/v1/chat/completions"
+
+    if stream:
+        client = httpx.AsyncClient(timeout=None)
+        try:
+            upstream_request = client.build_request("POST", url, content=body, headers=headers)
+            response = await client.send(upstream_request, stream=True)
+        except httpx.HTTPError as exc:
+            await client.aclose()
+            return _anthropic_error(502, "api_error", f"Metal upstream error: {exc}")
+        if not 200 <= response.status_code < 300:
+            try:
+                content = await response.aread()
+            finally:
+                await response.aclose()
+                await client.aclose()
+            return _anthropic_error(
+                response.status_code, "api_error", content.decode("utf-8", "replace")
+            )
+
+        handle.begin_request()
+
+        async def _events() -> AsyncIterator[str]:
+            usage: dict[str, Any] | None = None
+
+            async def _lines() -> AsyncIterator[bytes]:
+                nonlocal usage
+                async for line in response.aiter_lines():
+                    raw = line.encode()
+                    usage = _usage_from_sse_line(raw) or usage
+                    yield raw
+
+            try:
+                async for frame in chat_stream_to_anthropic(_lines(), public_model):
+                    yield frame
+            finally:
+                await response.aclose()
+                await client.aclose()
+                handle.finish_request(usage, completed=True)
+
+        return StreamingResponse(_events(), media_type="text/event-stream")
+
+    handle.begin_request()
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(None)) as client:
+            r = await client.post(url, content=body, headers=headers)
+    except httpx.HTTPError as exc:
+        handle.finish_request(None, completed=False)
+        return _anthropic_error(502, "api_error", f"Metal upstream error: {exc}")
+    ok = 200 <= r.status_code < 300
+    try:
+        payload = json.loads(r.content)
+    except (ValueError, UnicodeDecodeError):
+        payload = None
+    handle.finish_request(_usage_from_payload(payload), completed=ok)
+    if not ok or not isinstance(payload, dict):
+        return _anthropic_error(
+            r.status_code if not ok else 502,
+            "api_error",
+            r.content.decode("utf-8", "replace"),
+        )
+    message = chat_response_to_anthropic(payload, public_model)
+    return JSONResponse(message.model_dump(exclude_none=True))
+
+
+_tokenizers: dict[str, Any] = {}
+
+
+def _upstream_tokenizer(model_path: str) -> Any | None:
+    """The upstream model's tokenizer for count_tokens, loaded once per model
+    from the local HF cache (mlx_lm has already downloaded it). None when the
+    checkpoint ships no usable tokenizer."""
+    if model_path in _tokenizers:
+        return _tokenizers[model_path]
+    tokenizer = None
+    try:
+        from transformers import AutoTokenizer
+
+        tokenizer = AutoTokenizer.from_pretrained(model_path, local_files_only=True)
+    except Exception as exc:  # noqa: BLE001 - counting degrades to an estimate
+        logger.warning(f"count_tokens: no tokenizer for {model_path} ({exc}); estimating")
+    _tokenizers[model_path] = tokenizer
+    return tokenizer
+
+
+async def _count_tokens_anthropic(request: Request, get_backend: Any) -> Response:
+    from .metal_anthropic import AnthropicCountTokensRequest, count_tokens
+
+    handle = get_backend()
+    unavailable = _anthropic_backend_unavailable(handle)
+    if unavailable is not None:
+        return unavailable
+    try:
+        req = AnthropicCountTokensRequest.model_validate_json(await request.body())
+    except ValueError as exc:
+        return _anthropic_error(400, "invalid_request_error", str(exc))
+    tokenizer = await asyncio.to_thread(_upstream_tokenizer, handle.model_path)
+    return JSONResponse({"input_tokens": count_tokens(req, tokenizer)})
 
 
 async def _forward(

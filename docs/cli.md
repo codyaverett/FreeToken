@@ -157,6 +157,12 @@ Notes:
 - `ft serve --backend mlx|llama` also switches between these backends on a CUDA
   box, but still imports the CUDA config stack; `ft serve-metal` is the
   standalone, CUDA-free form for Apple Silicon.
+- Anthropic `/v1/messages` is translated to the upstream's chat completions
+  and back (text, thinking, tool_use blocks, streaming events), since neither
+  Metal engine speaks the Anthropic protocol itself. Images are dropped, and
+  `tool_choice: any|tool` degrades to `auto`. `/v1/messages/count_tokens`
+  counts with the model's tokenizer from the local HF cache, or estimates at
+  four characters per token when no tokenizer loads.
 
 ## ft shell
 
