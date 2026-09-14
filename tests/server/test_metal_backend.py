@@ -48,9 +48,17 @@ from freetoken.server import metal  # noqa: E402
 
 # ---------------------------------------------------------------- resolver --
 
-def test_resolve_backend_explicit_passthrough():
+def test_resolve_backend_explicit_passthrough(monkeypatch):
+    monkeypatch.setattr(metal, "mlx_importable", lambda: True)
+    monkeypatch.setattr(metal, "llama_binary", lambda: "/opt/homebrew/bin/llama-server")
     assert metal.resolve_backend("mlx") == "mlx"
     assert metal.resolve_backend("llama") == "llama"
+
+
+def test_resolve_backend_llama_needs_binary(monkeypatch):
+    monkeypatch.setattr(metal, "llama_binary", lambda: None)
+    with pytest.raises(RuntimeError, match="llama-server"):
+        metal.resolve_backend("llama")
 
 
 def test_resolve_backend_rejects_unknown():
