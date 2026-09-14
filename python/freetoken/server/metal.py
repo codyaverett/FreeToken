@@ -1349,6 +1349,11 @@ async def _forward_anthropic(request: Request, get_backend: Any) -> Response:
 
     public_model = req.model
     chat_body = anthropic_to_chat_request(req, upstream_model=handle.model_path)
+    logger.info(
+        f"anthropic /v1/messages: {len(chat_body['messages'])} messages, "
+        f"{len(chat_body.get('tools') or [])} tools, ~{len(json.dumps(chat_body['messages'])) // 4} prompt tokens, "
+        f"max_tokens={req.max_tokens}, stream={bool(req.stream)}, thinking={req.thinking}"
+    )
     body, stream = _inject_turn_stop(
         "/v1/chat/completions", json.dumps(chat_body).encode(), bool(req.stream)
     )
