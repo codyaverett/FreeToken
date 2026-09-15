@@ -55,8 +55,22 @@ make health          # check on it later
 make stop            # shut it down
 ```
 
-It does not survive a logout or reboot. For that, wrap the same command in a
-launchd agent of your own.
+That survives a closed terminal but not a logout or reboot. For those, install
+the server as a per-user login item:
+
+```bash
+make stop                                        # free the port first
+make agent-install MODEL=mlx-community/Qwen3-8B-4bit
+make agent-status                                # state, pid, last exit code
+make agent-uninstall                             # remove it again
+```
+
+`agent-install` writes `~/Library/LaunchAgents/org.freetoken.metal.plist` and
+loads it into your own launchd domain, with `RunAtLoad` and `KeepAlive` so the
+server starts at login and restarts if it exits. It is a per-user agent, not a
+system daemon, and needs no `sudo`. `agent-uninstall` unloads it and deletes
+the plist. The model and port are baked into the plist at install time, so
+re-run `agent-install` after changing them.
 
 `scripts/start-metal.sh [model]` does the same plus attaches `ft shell`;
 `NO_CHAT=1 scripts/start-metal.sh` starts the API only.

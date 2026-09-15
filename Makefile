@@ -8,7 +8,7 @@ PY    := $(VENV)/bin/python
 FT    := $(VENV)/bin/ft
 LOG   ?= /tmp/ft-metal.log
 
-.PHONY: help venv serve serve-bg serve-8b serve-8b-bg serve-small stop restart health chat models cache test bench logs
+.PHONY: help venv serve serve-bg serve-8b serve-8b-bg serve-small stop restart health chat models cache test bench logs agent-install agent-uninstall agent-status
 
 help:
 	@echo "make serve                 serve $(MODEL) on port $(PORT)"
@@ -24,6 +24,9 @@ help:
 	@echo "make bench                 measure decode tokens/sec"
 	@echo "make test                  run the torch-free Metal test files"
 	@echo "make cache                 list the Hugging Face model cache"
+	@echo "make agent-install         start the server at login and keep it up"
+	@echo "make agent-uninstall       remove that login item"
+	@echo "make agent-status          show whether it is loaded"
 
 venv: $(FT)
 $(FT):
@@ -80,3 +83,51 @@ logs:
 
 cache:
 	@$(VENV)/bin/hf cache ls
+
+# Run the server as a per-user login item so it comes back after a reboot and
+# restarts if it exits. Writes one plist to ~/Library/LaunchAgents and loads it
+# into the user's own launchd domain; agent-uninstall reverses both steps.
+# Override MODEL/PORT to pin what the login item serves.
+AGENT_LABEL := org.freetoken.metal
+AGENT_PLIST := $(HOME)/Library/LaunchAgents/$(AGENT_LABEL).plist
+
+agent-install: venv
+	@lsof -iTCP:$(PORT) -sTCP:LISTEN >/dev/null 2>&1 \
+	  && { echo "port $(PORT) is already served; run 'make stop' first"; exit 1; } || true
+	@mkdir -p $(HOME)/Library/LaunchAgents
+	@printf '%s\n' \
+	  '<?xml version="1.0" encoding="UTF-8"?>' \
+	  '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
+	  '<plist version="1.0">' \
+	  '<dict>' \
+	  '  <key>Label</key><string>$(AGENT_LABEL)</string>' \
+	  '  <key>ProgramArguments</key>' \
+	  '  <array>' \
+	  '    <string>$(CURDIR)/$(FT)</string>' \
+	  '    <string>serve</string>' \
+	  '    <string>--model</string><string>$(MODEL)</string>' \
+	  '    <string>--port</string><string>$(PORT)</string>' \
+	  '  </array>' \
+	  '  <key>WorkingDirectory</key><string>$(CURDIR)</string>' \
+	  '  <key>RunAtLoad</key><true/>' \
+	  '  <key>KeepAlive</key><true/>' \
+	  '  <key>ProcessType</key><string>Background</string>' \
+	  '  <key>StandardOutPath</key><string>$(LOG)</string>' \
+	  '  <key>StandardErrorPath</key><string>$(LOG)</string>' \
+	  '</dict>' \
+	  '</plist>' > $(AGENT_PLIST)
+	@plutil -lint $(AGENT_PLIST) >/dev/null
+	@launchctl bootout gui/$$(id -u)/$(AGENT_LABEL) 2>/dev/null || true
+	@launchctl bootstrap gui/$$(id -u) $(AGENT_PLIST)
+	@echo "installed $(AGENT_PLIST)"
+	@echo "serving $(MODEL) on :$(PORT), log $(LOG); remove with: make agent-uninstall"
+
+agent-uninstall:
+	@launchctl bootout gui/$$(id -u)/$(AGENT_LABEL) 2>/dev/null || true
+	@rm -f $(AGENT_PLIST)
+	@echo "removed $(AGENT_LABEL) and its plist"
+
+agent-status:
+	@launchctl print gui/$$(id -u)/$(AGENT_LABEL) 2>/dev/null \
+	  | grep -E '^\s+(state|pid|last exit code) ' \
+	  || echo "$(AGENT_LABEL) is not loaded"
