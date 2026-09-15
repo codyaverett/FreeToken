@@ -20,6 +20,18 @@ for `--backend llama` with GGUF files.
 
 ## Start
 
+The `Makefile` wraps the common commands; `make help` lists them.
+
+```bash
+make serve                              # Qwen3-14B-4bit on port 1919
+make serve-8b                           # Qwen3-8B-4bit, about 2x the tokens/sec
+make serve MODEL=<repo> PORT=<port>     # anything else
+make serve-bg                           # background, logs to /tmp/ft-metal.log
+make stop                               # stop the server and its upstream engine
+```
+
+Or drive it directly:
+
 ```bash
 source .venv/bin/activate
 ft serve --model mlx-community/Qwen3-0.6B-4bit --port 1919
@@ -140,6 +152,38 @@ Deleting a `models--*` directory by hand works too, but deleting only a
 snapshot leaves its blobs behind and reclaims nothing. Other runtimes keep
 their own stores (Ollama in `~/.ollama`, LM Studio in `~/.lmstudio`); those
 are separate from this cache and often larger.
+
+## Throughput
+
+Decode is memory-bandwidth bound, not compute bound. Every token reads the
+whole weight set, so the ceiling is roughly the chip's bandwidth divided by the
+weight bytes, and MLX reaches about three quarters of it. A base M1 has
+68 GB/s. Measured on one, with `make bench`:
+
+| Model | Weights | Measured | Ceiling | Of ceiling |
+| --- | --- | --- | --- | --- |
+| `Qwen3-8B-4bit` | 4.3 GB | 12.2 tok/s | 15.9 tok/s | 77% |
+| `Qwen3-14B-4bit` | 7.7 GB | 6.5 tok/s | 8.9 tok/s | 73% |
+
+Two consequences. Halving the weights roughly doubles the rate, which is the
+only large lever available. And a model that fits but nearly fills memory is
+slow for a second reason: paging.
+
+```bash
+make serve-bg && make bench       # bench takes --weights-gb for the ceiling line
+```
+
+**Memory pressure costs about a quarter of the rate.** The same 14B model
+measured 5.0 tok/s with 6 GB of swap in use and 6.5 tok/s with 1.6 GB. Check
+`sysctl vm.swapusage` before benchmarking and close whatever is holding RAM;
+browsers, virtual machines and Docker are the usual culprits.
+
+**Speculative decoding does not help here.** Drafting Qwen3-14B with
+Qwen3-0.6B (`mlx_lm server --draft-model`, 4 draft tokens) measured 4.1 tok/s
+against a 6.5 tok/s control on the same engine, a 35% loss. On a bandwidth-
+bound part the draft model's own weight reads and the verification pass cost
+more than the accepted tokens save. This is why the Metal launcher does not
+expose `--draft-model`.
 
 ## Tests
 
