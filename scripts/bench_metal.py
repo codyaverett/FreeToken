@@ -25,14 +25,15 @@ BANDWIDTH = {"M1": 68.25, "M1 Pro": 200.0, "M1 Max": 400.0, "M1 Ultra": 800.0,
 
 
 def _chip() -> str:
+    """The marketing chip name, e.g. "Apple M1 Pro"; empty when it cannot be read."""
     try:
-        out = subprocess.run(["system_profiler", "SPHardwareDataType"],
-                             capture_output=True, text=True, timeout=30).stdout
-        for line in out.splitlines():
-            if "Chip:" in line:
-                return line.split("Chip:", 1)[1].strip()
-    except Exception:
-        pass
+        proc = subprocess.run(["system_profiler", "SPHardwareDataType"],
+                              capture_output=True, text=True, timeout=30, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    for line in proc.stdout.splitlines():
+        if "Chip:" in line:
+            return line.split("Chip:", 1)[1].strip()
     return ""
 
 
