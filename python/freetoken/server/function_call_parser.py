@@ -151,6 +151,17 @@ def _is_complete_json(input_str: str) -> bool:
         return False
 
 
+_MINICPM5_CALL_RE = re.compile(r'<function\s+name="')
+_CDATA_RE = re.compile(r"^\s*<!\[CDATA\[(.*)\]\]>\s*$", re.DOTALL)
+
+
+def _strip_cdata(value: str) -> str:
+    """Unwrap a ``<![CDATA[...]]>`` value; MiniCPM5's template wraps any value
+    containing ``<``, ``&`` or a newline that way."""
+    match = _CDATA_RE.match(value)
+    return match.group(1) if match else value
+
+
 def _parse_loose_json_value(value: str) -> Any:
     try:
         return json.loads(value)
@@ -2870,6 +2881,103 @@ class MiniMaxM3Detector(BaseFormatDetector):
         return StreamingParseResult(normal_text="".join(normal_parts), calls=calls)
 
 
+class MiniCpm5Detector(InvokeParamStreamMixin, BaseFormatDetector):
+    """FreeToken serving adapter for MiniCPM5's bare function/param XML calls.
+
+    Wire format -- unlike the other invoke/parameter families there is no wrapper
+    block, the function tag opens the call itself:
+
+    ```
+    <function name="get_weather"><param name="city">Paris</param></function>
+    ```
+
+    Values are raw text (not JSON), and the chat template wraps any value holding
+    ``<``, ``&`` or a newline in ``<![CDATA[...]]>``, so every value buffers until
+    its ``</param>`` closes instead of streaming character by character: the CDATA
+    wrapper has to be stripped from a whole value, never from a fragment of one.
+
+    Two consequences of a format with no wrapper: streaming cannot tell a quoted
+    ``<function name="`` in prose from a real call (every XML detector here has
+    that property), and text BETWEEN two calls in one turn is dropped rather than
+    surfaced as content.
+    """
+
+    toolcall_opener = None  # "<function" alone is not unique enough to anchor on
+    _ps_trim = "\n"
+    _ps_missing_type = "loose"
+    _ps_outer_open = "<function"
+    _ps_outer_close = ""
+    _ps_invoke_open_prefix = ""
+    # The buffer starts just past "<function" for the call that opened the block
+    # (the outer token is consumed) and at "<function ..." for every later one in
+    # the same block, so the name tag has to anchor on both.
+    _ps_invoke_open_re = re.compile(r'(?:^|<function)\s+name="([^"]+)"\s*>')
+    _ps_invoke_close = "</function>"
+    _ps_param_open_prefix = "<param"
+    _ps_param_open_re = re.compile(r'<param\s+name="([^"]+)"\s*>')
+    _ps_param_close = "</param>"
+
+    def __init__(self):
+        super().__init__()
+        self.bot_token = "<function"
+        self.eot_token = "</function>"
+        self.function_regex = re.compile(
+            r'<function\s+name="([^"]+)"\s*>(.*?)</function>', re.DOTALL
+        )
+        self.param_regex = re.compile(r'<param\s+name="([^"]+)"\s*>(.*?)</param>', re.DOTALL)
+        self._ps_reset()
+
+    def has_tool_call(self, text: str) -> bool:
+        return bool(_MINICPM5_CALL_RE.search(text))
+
+    def _schema_param_type(self, param_name: str, param_config: Dict, missing: str = "string") -> str:
+        # Never the char-by-char "string" path: see the CDATA note in the docstring.
+        return "loose"
+
+    def _ps_convert_value(self, key: str, raw: str) -> Any:
+        return super()._ps_convert_value(key, _strip_cdata(raw))
+
+    def finish_streaming(self) -> str:
+        # The format has no block terminator, so a finished call leaves the parser
+        # in "block" mode with any trailing prose still buffered. Release it when
+        # nothing in the buffer looks like the start of another call.
+        if getattr(self, "_ps_mode", "idle") == "block" and self.bot_token not in self._buffer:
+            residual, self._buffer = self._buffer, ""
+            self._ps_reset()
+            return residual
+        return super().finish_streaming()
+
+    def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
+        match = _MINICPM5_CALL_RE.search(text)
+        if match is None:
+            return StreamingParseResult(normal_text=text, calls=[])
+
+        normal_text = text[: match.start()].strip()
+        tool_indices = self._get_tool_indices(tools)
+        calls: List[ToolCallItem] = []
+        for func_name, invoke_body in self.function_regex.findall(text):
+            if func_name not in tool_indices and not _should_forward_unknown_tool(func_name):
+                logger.warning(f"Model attempted to call undefined function: {func_name}")
+                continue
+            args = {}
+            config = self._get_param_config(func_name, tools)
+            for name, value in self.param_regex.findall(invoke_body):
+                key = name.strip()
+                raw = _strip_cdata(value.strip("\n"))
+                if key in config:
+                    args[key] = self._convert_param_value(raw, key, config, func_name)
+                else:
+                    args[key] = _parse_loose_json_value(raw)
+            calls.append(
+                ToolCallItem(
+                    tool_index=len(calls),
+                    name=func_name,
+                    parameters=json.dumps(args, ensure_ascii=False),
+                )
+            )
+        return StreamingParseResult(normal_text=normal_text, calls=calls)
+
+
 class GptOssDetector(BaseFormatDetector):
     """FreeToken serving adapter for Harmony ``to=functions.*`` tool calls.
 
@@ -3528,6 +3636,7 @@ class FunctionCallParser:
         "gpt_oss": GptOssDetector,
         "glm47": Glm47Detector,
         "llama3": Llama32Detector,
+        "minicpm5": MiniCpm5Detector,
         "minimax": MiniMaxDetector,
         "minimax_m3": MiniMaxM3Detector,
         "mistral": MistralDetector,

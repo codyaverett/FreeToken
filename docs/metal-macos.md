@@ -125,6 +125,7 @@ totals at a 32k-token context:
 | Model | Weights | KV at 32k | Total | Verdict |
 | --- | --- | --- | --- | --- |
 | `Qwen3-0.6B-4bit` | 0.4 GB | 0.9 GB | 1.3 GB | smoke tests only |
+| `MiniCPM5-2B-MLX` | 1.4 GB | 0.7 GB | 2.1 GB | comfortable, 2 KV heads |
 | `Qwen3-8B-4bit` | 4.3 GB | 4.5 GB | 8.8 GB | comfortable |
 | `Qwen3-14B-4bit` | 7.7 GB | 5.0 GB | 12.7 GB | fits short prompts, not long ones |
 | `gpt-oss-20b-MXFP4-Q8` | 11.2 GB | 1.5 GB | 12.7 GB | the ceiling |
@@ -150,6 +151,18 @@ Three things decide that table.
 Qwen3 models think by default. Send `"thinking": {"type": "disabled"}` on
 `/v1/messages` (or `chat_template_kwargs: {"enable_thinking": false}` on the
 OpenAI route) to skip the thinking block.
+
+### Tool calls the upstream cannot parse
+
+mlx_lm picks a tool-call parser by pattern-matching the model's chat template.
+A model whose grammar it does not recognize still gets the request's tools
+templated into its prompt, but the call it writes comes back as assistant text
+with `tool_calls: null`, which stalls any agent loop reading the OpenAI wire
+format. The proxy parses those families itself with FreeToken's own detectors
+and re-emits the calls in the OpenAI shape, streaming and buffered, which covers
+the Anthropic route too. `MiniCPM5-2B-MLX` and its bare
+`<function name="f"><param name="p">v</param></function>` grammar is the case
+this exists for; `server/metal_tool_calls.py` lists the families it applies to.
 
 ## Disk and the model cache
 
@@ -213,6 +226,7 @@ The Metal path is torch-free, so only these files run in this venv:
 
 ```bash
 python -m pytest tests/server/test_metal_backend.py tests/server/test_serve_macos.py \
+  tests/server/test_minicpm5_tool_calls.py \
   tests/daemon/test_serve_command_platform.py tests/server/test_process_utils.py \
   tests/test_logger.py tests/test_shell_client.py tests/test_shell_tui.py -q
 ```

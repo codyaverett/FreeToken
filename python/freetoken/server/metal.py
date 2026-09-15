@@ -51,6 +51,8 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from freetoken.logging import init_logger
 
+from .metal_tool_calls import rewriter_for
+
 logger = init_logger(__name__)
 
 #: Upstream serves on a loopback port inside this range (FreeToken's own API keeps
@@ -1016,6 +1018,7 @@ async def _proxy_stream(
     response: httpx.Response,
     client: httpx.AsyncClient,
     handle: MetalBackendHandle,
+    rewriter: Any = None,
 ) -> AsyncIterator[bytes]:
     """Stream a pre-opened successful upstream response to the client.
 
@@ -1027,7 +1030,11 @@ async def _proxy_stream(
     A partial final line is retained across arbitrary transport chunks so the
     JSON key can never straddle two independent replacements. The request has
     already received its upstream status before this iterator is returned, so
-    FastAPI does not commit a false HTTP 200 for upstream errors."""
+    FastAPI does not commit a false HTTP 200 for upstream errors.
+
+    ``rewriter`` (a ToolCallRewriter) additionally lifts tool calls out of the
+    assistant text for models the upstream cannot parse; None leaves the chunk
+    text alone."""
     pending = b""
     usage: dict[str, Any] | None = None
     completed = 200 <= response.status_code < 300
@@ -1038,9 +1045,13 @@ async def _proxy_stream(
                 line, pending = pending.split(b"\n", 1)
                 framed = line + b"\n"
                 usage = _usage_from_sse_line(line) or usage
+                if rewriter is not None:
+                    framed = rewriter.rewrite_line(framed)
                 yield _rewrite_reasoning_field(framed)
         if pending:
             usage = _usage_from_sse_line(pending) or usage
+            if rewriter is not None:
+                pending = rewriter.rewrite_line(pending)
             yield _rewrite_reasoning_field(pending)
     finally:
         await response.aclose()
@@ -1357,6 +1368,7 @@ async def _forward_anthropic(request: Request, get_backend: Any) -> Response:
     body, stream = _inject_turn_stop(
         "/v1/chat/completions", json.dumps(chat_body).encode(), bool(req.stream)
     )
+    rewriter = rewriter_for(body, handle.model_path)
     headers = {"content-type": "application/json", "accept": "application/json"}
     url = f"{handle.upstream_base_url}/v1/chat/completions"
 
@@ -1388,7 +1400,14 @@ async def _forward_anthropic(request: Request, get_backend: Any) -> Response:
                 async for line in response.aiter_lines():
                     raw = line.encode()
                     usage = _usage_from_sse_line(raw) or usage
-                    yield raw
+                    if rewriter is None:
+                        yield raw
+                        continue
+                    # One upstream line can become several chunks; this consumer
+                    # reads one event per item, so re-split the framing.
+                    for frame in rewriter.rewrite_line(raw).split(b"\n"):
+                        if frame.strip():
+                            yield frame
 
             try:
                 async for frame in chat_stream_to_anthropic(_lines(), public_model):
@@ -1419,6 +1438,8 @@ async def _forward_anthropic(request: Request, get_backend: Any) -> Response:
             "api_error",
             r.content.decode("utf-8", "replace"),
         )
+    if rewriter is not None:
+        rewriter.rewrite_payload(payload)
     message = chat_response_to_anthropic(payload, public_model)
     return JSONResponse(message.model_dump(exclude_none=True))
 
@@ -1495,6 +1516,11 @@ async def _forward(
             payload = {}
         stream = bool(payload.get("stream")) if isinstance(payload, dict) else False
 
+    rewriter = (
+        rewriter_for(body, handle.model_path)
+        if request.url.path.endswith("/chat/completions")
+        else None
+    )
     # Some gemma-4 snapshots omit the turn-end token (<turn|>) from their
     # generation config, so inject it as a defensive stop word for that family.
     body = _rewrite_public_model(body, handle)
@@ -1533,7 +1559,7 @@ async def _forward(
 
         handle.begin_request()
         return StreamingResponse(
-            _proxy_stream(response, client, handle),
+            _proxy_stream(response, client, handle, rewriter),
             status_code=response.status_code,
             media_type=response.headers.get("content-type", "text/event-stream").split(
                 ";", 1
@@ -1564,6 +1590,13 @@ async def _forward(
         except (ValueError, UnicodeDecodeError):
             usage = None
         handle.finish_request(usage, completed=200 <= r.status_code < 300)
+    if rewriter is not None and 200 <= r.status_code < 300:
+        try:
+            payload = json.loads(content)
+        except (ValueError, UnicodeDecodeError):
+            payload = None
+        if rewriter.rewrite_payload(payload):
+            content = json.dumps(payload, ensure_ascii=False).encode()
     # Same reasoning-channel rename as the streaming path, for non-streaming
     # completions (mlx_lm's "reasoning" -> FreeToken's "reasoning_content").
     if b'"reasoning":' in content:

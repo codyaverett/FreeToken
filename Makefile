@@ -75,6 +75,7 @@ bench:
 
 test: venv
 	$(PY) -m pytest tests/server/test_metal_backend.py tests/server/test_serve_macos.py \
+	  tests/server/test_minicpm5_tool_calls.py \
 	  tests/daemon/test_serve_command_platform.py tests/server/test_process_utils.py \
 	  tests/test_logger.py tests/test_shell_client.py tests/test_shell_tui.py -q
 

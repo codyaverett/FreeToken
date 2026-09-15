@@ -199,6 +199,9 @@ def parse_args(
             return "minimax"
         if "muse_glimmer" in marker or "muse-glimmer" in marker or "museglimmer" in marker:
             return "muse_glimmer"
+        # MiniCPM5 reports model_type "llama"; only the name carries the family.
+        if "minicpm5" in marker:
+            return "minicpm5"
         if "gemma4" in marker:
             return "gemma4"
         if "qwen4_exp" in marker or "qwen4exp" in marker or "qwen3.8-flash" in marker:
@@ -566,6 +569,7 @@ def parse_args(
             "deepseekv32",
             "gemma4",
             "glm47",
+            "minicpm5",
             "minimax",
             "minimax_m3",
             "muse_glimmer",
