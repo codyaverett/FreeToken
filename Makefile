@@ -8,7 +8,7 @@ PY    := $(VENV)/bin/python
 FT    := $(VENV)/bin/ft
 LOG   ?= /tmp/ft-metal.log
 
-.PHONY: help venv serve serve-bg serve-8b serve-small stop restart health chat models cache test bench
+.PHONY: help venv serve serve-bg serve-8b serve-8b-bg serve-small stop restart health chat models cache test bench logs
 
 help:
 	@echo "make serve                 serve $(MODEL) on port $(PORT)"
@@ -16,6 +16,8 @@ help:
 	@echo "make serve-8b              serve Qwen3-8B-4bit (faster, ~2x tok/s)"
 	@echo "make serve-small           serve Qwen3-0.6B-4bit (smoke tests)"
 	@echo "make serve-bg              serve in the background, log to $(LOG)"
+	@echo "make serve-8b-bg           serve Qwen3-8B-4bit in the background"
+	@echo "make logs                  follow the background server log"
 	@echo "make stop / restart        stop the server and its upstream engine"
 	@echo "make health / models       query a running server"
 	@echo "make chat                  attach ft shell to a running server"
@@ -37,6 +39,9 @@ serve-8b:
 
 serve-small:
 	@$(MAKE) serve MODEL=mlx-community/Qwen3-0.6B-4bit
+
+serve-8b-bg:
+	@$(MAKE) serve-bg MODEL=mlx-community/Qwen3-8B-4bit
 
 serve-bg: venv
 	@nohup $(FT) serve --model $(MODEL) --port $(PORT) > $(LOG) 2>&1 & \
@@ -69,6 +74,9 @@ test: venv
 	$(PY) -m pytest tests/server/test_metal_backend.py tests/server/test_serve_macos.py \
 	  tests/daemon/test_serve_command_platform.py tests/server/test_process_utils.py \
 	  tests/test_logger.py tests/test_shell_client.py tests/test_shell_tui.py -q
+
+logs:
+	@tail -f $(LOG)
 
 cache:
 	@$(VENV)/bin/hf cache ls

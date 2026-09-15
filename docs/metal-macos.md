@@ -44,11 +44,19 @@ server is usable when `/health` reports `"maintenance": "serving"`:
 curl -s localhost:1919/health
 ```
 
-Run it in the background and keep the log:
+Run it in the background. `serve-bg` detaches the server, waits until it
+answers `/health`, and leaves it reparented to launchd, so it keeps serving
+after the terminal closes:
 
 ```bash
-nohup ft serve --model mlx-community/Qwen3-0.6B-4bit --port 1919 > /tmp/ft-metal.log 2>&1 &
+make serve-8b-bg     # or: make serve-bg MODEL=<repo>
+make logs            # follow /tmp/ft-metal.log
+make health          # check on it later
+make stop            # shut it down
 ```
+
+It does not survive a logout or reboot. For that, wrap the same command in a
+launchd agent of your own.
 
 `scripts/start-metal.sh [model]` does the same plus attaches `ft shell`;
 `NO_CHAT=1 scripts/start-metal.sh` starts the API only.
